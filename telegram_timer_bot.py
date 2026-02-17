@@ -241,24 +241,26 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     seconds = -1
     display_duration = ""
+    name = ""
 
-    # Проверяем, является ли последний аргумент форматом ЧЧ:ММ:СС / ММ:СС
+    # Формат ЧЧ:ММ:СС — последний аргумент содержит ":"
     if ":" in args[-1]:
         name = " ".join(args[:-1])
         seconds = parse_hhmmss(args[-1])
         display_duration = args[-1]
+
+    # Формат <число> <единица> — нужно минимум 3 аргумента: имя число единица
     elif len(args) >= 3:
-        *name_parts, value_str, unit_str = args
-        name = " ".join(name_parts)
+        name = " ".join(args[:-2])
+        value_str = args[-2]
+        unit_str = args[-1]
         seconds = parse_duration(value_str, unit_str)
         display_duration = f"{value_str} {unit_str}"
-    else:
-        name = args[0]  # на случай если только 1 аргумент после имени — покажем ошибку ниже
 
-    if seconds <= 0:
+    if not name or seconds <= 0:
         await update.message.reply_text(
-            "❌ Не удалось распознать время.\n"
-            "Используйте: `30 мин`, `1 час`, `90 сек` или `01:30:00`",
+            "❌ Не удалось распознать команду.\n"
+            "Используйте: `/add Пицца 30 мин`, `/add Стирка 1 час` или `/add Пицца 00:30:00`",
             parse_mode="Markdown",
         )
         return
