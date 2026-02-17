@@ -278,15 +278,26 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cancel <имя> — отменить таймер по имени."""
+    """/cancel <имя> | all — отменить таймер по имени или все сразу."""
     if not context.args:
         await update.message.reply_text(
-            "❌ Использование: `/cancel <имя>`", parse_mode="Markdown"
+            "❌ Использование: `/cancel <имя>` или `/cancel all`", parse_mode="Markdown"
         )
         return
 
     name = " ".join(context.args)
     chat_id = update.effective_chat.id
+
+    if name.lower() == "all":
+        timers = active_timers.get(chat_id, {})
+        if not timers:
+            await update.message.reply_text("📭 Нет активных таймеров для отмены.")
+            return
+        count = len(timers)
+        for task, _ in list(timers.values()):
+            task.cancel()
+        await update.message.reply_text(f"🛑 Все таймеры отменены ({count} шт.).")
+        return
 
     if chat_id not in active_timers or name not in active_timers[chat_id]:
         await update.message.reply_text(f"❌ Таймер «{name}» не найден.")
@@ -302,7 +313,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/add <имя> <число> <единица>` — создать таймер\n"
         "   Пример: `/add Пицца 30 мин`\n\n"
         "`/list` — показать активные таймеры\n\n"
-        "`/cancel <имя>` — отменить таймер\n\n"
+        "`/cancel <имя>` — отменить таймер\n"
+        "`/cancel all` — отменить все таймеры\n\n"
         "Единицы времени: `сек`, `мин`, `час`\n\n"
         "Бот предупредит за 1 минуту до завершения (если таймер > 1 мин).\n"
         "При перезапуске все таймеры автоматически восстанавливаются.",
