@@ -99,6 +99,7 @@ def parse_hhmmss(value: str) -> int:
 
 
 
+def parse_duration(value: str, unit: str) -> int:
     """Конвертирует значение + единицу в секунды. Возвращает -1 при ошибке."""
     unit = unit.lower().strip()
     try:
