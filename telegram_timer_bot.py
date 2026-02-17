@@ -81,7 +81,24 @@ def load_timers_raw() -> dict:
 
 # ═══════════════════════════ ТАЙМЕРЫ ═════════════════════════════════
 
-def parse_duration(value: str, unit: str) -> int:
+def parse_hhmmss(value: str) -> int:
+    """Парсит строку вида ЧЧ:ММ:СС или ММ:СС в секунды. Возвращает -1 при ошибке."""
+    parts = value.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, s = 0, int(parts[0]), int(parts[1])
+        else:
+            return -1
+        if m >= 60 or s >= 60:
+            return -1
+        return h * 3600 + m * 60 + s
+    except ValueError:
+        return -1
+
+
+
     """Конвертирует значение + единицу в секунды. Возвращает -1 при ошибке."""
     unit = unit.lower().strip()
     try:
@@ -209,29 +226,42 @@ async def restore_timers(bot):
 # ═════════════════════════ ОБРАБОТЧИКИ ═══════════════════════════════
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/add <имя> <число> <единица>"""
+    """/add <имя> <число> <единица>  или  /add <имя> <ЧЧ:ММ:СС>"""
     args = context.args
-    if not args or len(args) < 3:
+    if not args or len(args) < 2:
         await update.message.reply_text(
-            "❌ Использование: `/add <имя> <число> <единица>`\n"
-            "Пример: `/add Пицца 30 мин`\n"
+            "❌ Использование:\n"
+            "`/add <имя> <число> <единица>` — например `/add Пицца 30 мин`\n"
+            "`/add <имя> <ЧЧ:ММ:СС>` — например `/add Пицца 00:30:00`\n"
             "Единицы: сек / мин / час",
             parse_mode="Markdown",
         )
         return
 
-    *name_parts, value_str, unit_str = args
-    name = " ".join(name_parts)
+    chat_id = update.effective_chat.id
+    seconds = -1
+    display_duration = ""
 
-    seconds = parse_duration(value_str, unit_str)
+    # Проверяем, является ли последний аргумент форматом ЧЧ:ММ:СС / ММ:СС
+    if ":" in args[-1]:
+        name = " ".join(args[:-1])
+        seconds = parse_hhmmss(args[-1])
+        display_duration = args[-1]
+    elif len(args) >= 3:
+        *name_parts, value_str, unit_str = args
+        name = " ".join(name_parts)
+        seconds = parse_duration(value_str, unit_str)
+        display_duration = f"{value_str} {unit_str}"
+    else:
+        name = args[0]  # на случай если только 1 аргумент после имени — покажем ошибку ниже
+
     if seconds <= 0:
         await update.message.reply_text(
-            "❌ Не удалось распознать время. Используйте: `30 мин`, `1 час`, `90 сек`",
+            "❌ Не удалось распознать время.\n"
+            "Используйте: `30 мин`, `1 час`, `90 сек` или `01:30:00`",
             parse_mode="Markdown",
         )
         return
-
-    chat_id = update.effective_chat.id
 
     # Если таймер с таким именем уже есть — отменяем старый
     if chat_id in active_timers and name in active_timers[chat_id]:
@@ -250,7 +280,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ Таймер *«{name}»* запущен!\n"
-        f"⏱ Продолжительность: {value_str} {unit_str}\n"
+        f"⏱ Продолжительность: {display_duration}\n"
         f"🏁 Завершение в {finish_str}"
         f"{warning_note}",
         parse_mode="Markdown",
@@ -311,7 +341,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Справка по боту:*\n\n"
         "`/add <имя> <число> <единица>` — создать таймер\n"
-        "   Пример: `/add Пицца 30 мин`\n\n"
+        "   Пример: `/add Пицца 30 мин`\n"
+        "`/add <имя> <ЧЧ:ММ:СС>` — создать таймер в формате времени\n"
+        "   Пример: `/add Пицца 00:30:00`\n\n"
         "`/list` — показать активные таймеры\n\n"
         "`/cancel <имя>` — отменить таймер\n"
         "`/cancel all` — отменить все таймеры\n\n"
