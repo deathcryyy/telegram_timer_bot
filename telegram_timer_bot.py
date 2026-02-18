@@ -3,18 +3,28 @@ Telegram Timer Bot
 ==================
 Команды:
   /add <имя> <время> <единица> — добавить объект с таймером
+      Примеры:
+        /add Пицца 30 мин
+        /add Стирка 1 час
+        /add Лекарство 90 сек
+        /add Пицца 00:30:00
+        /add Пицца 0 30 0
+        /add Пицца 1ч30м
+        /add Пицца 45м
+        /add Пицца 2ч
   /list   — список активных таймеров
   /cancel <имя> — отменить таймер
 
-Установка: py -m pip install python-telegram-bot --upgrade
+Установка: py -m pip install python-telegram-bot redis --upgrade
 """
 
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.error import TimedOut, NetworkError
@@ -24,6 +34,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN       = "8518716891:AAHaKareX_3dzTSDGyzLZV842OzjGFyNRlo"   # <-- токен от @BotFather
 ALLOWED_CHAT_ID = -5130704239                    # <-- ID чата (например: -1001234567890)
 SAVE_FILE       = "timers.json"
+
+TZ_MAIN   = ZoneInfo("Europe/Moscow")   # МСК (UTC+3)
+TZ_SAMARA = ZoneInfo("Europe/Samara")   # Самара (UTC+4)
 # ─────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -33,6 +46,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 active_timers: Dict[int, Dict[str, tuple]] = {}
+
+
+# ═══════════════════════════ ВРЕМЯ ═══════════════════════════════════
+
+def now_msk() -> datetime:
+    """Текущее время в МСК."""
+    return datetime.now(tz=TZ_MAIN)
+
+def fmt_time(dt: datetime) -> str:
+    """Форматирует время в МСК с самарским в скобках."""
+    msk = dt.astimezone(TZ_MAIN)
+    sam = dt.astimezone(TZ_SAMARA)
+    return f"{msk.strftime('%H:%M:%S')} МСК ({sam.strftime('%H:%M:%S')} Самара)"
 
 
 # ═══════════════════════════ ФИЛЬТР ЧАТА ═════════════════════════════
@@ -47,6 +73,24 @@ async def reject(update: Update):
 # ═══════════════════════════ СОХРАНЕНИЕ ══════════════════════════════
 
 def save_timers():
+    # Пробуем Redis если доступен
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        try:
+            import redis
+            r = redis.from_url(redis_url)
+            data = {}
+            for chat_id, timers in active_timers.items():
+                data[str(chat_id)] = {
+                    name: finish_at.isoformat()
+                    for name, (task, finish_at) in timers.items()
+                }
+            r.set("timers", json.dumps(data, ensure_ascii=False))
+            return
+        except Exception as e:
+            logger.error("Ошибка сохранения в Redis: %s", e)
+
+    # Fallback — файл
     data = {}
     for chat_id, timers in active_timers.items():
         data[str(chat_id)] = {
@@ -61,6 +105,18 @@ def save_timers():
 
 
 def load_timers_raw() -> dict:
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        try:
+            import redis
+            r = redis.from_url(redis_url)
+            raw = r.get("timers")
+            if raw:
+                return json.loads(raw)
+            return {}
+        except Exception as e:
+            logger.error("Ошибка чтения из Redis: %s", e)
+
     if not os.path.exists(SAVE_FILE):
         return {}
     try:
@@ -74,7 +130,6 @@ def load_timers_raw() -> dict:
 # ═══════════════════════════ ОТПРАВКА С RETRY ════════════════════════
 
 async def send_with_retry(bot, chat_id: int, text: str, retries: int = 5, delay: float = 5.0):
-    """Отправляет сообщение с повторными попытками при сетевых ошибках."""
     for attempt in range(1, retries + 1):
         try:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -84,10 +139,7 @@ async def send_with_retry(bot, chat_id: int, text: str, retries: int = 5, delay:
                 logger.error("Не удалось отправить сообщение после %d попыток: %s", retries, e)
                 return
             wait = delay * attempt
-            logger.warning(
-                "Ошибка отправки (попытка %d/%d): %s. Повтор через %.0f сек...",
-                attempt, retries, e, wait
-            )
+            logger.warning("Ошибка отправки (попытка %d/%d): %s. Повтор через %.0f сек...", attempt, retries, e, wait)
             await asyncio.sleep(wait)
         except Exception as e:
             logger.error("Неожиданная ошибка при отправке: %s", e)
@@ -97,6 +149,7 @@ async def send_with_retry(bot, chat_id: int, text: str, retries: int = 5, delay:
 # ═══════════════════════════ ПАРСИНГ ВРЕМЕНИ ═════════════════════════
 
 def parse_hhmmss(value: str) -> int:
+    """ЧЧ:ММ:СС или ММ:СС"""
     parts = value.split(":")
     try:
         if len(parts) == 3:
@@ -112,7 +165,33 @@ def parse_hhmmss(value: str) -> int:
         return -1
 
 
+def parse_compact(value: str) -> int:
+    """
+    Парсит компактный формат: 1ч30м, 45м, 2ч, 90с, 1ч30м20с и т.д.
+    Возвращает секунды или -1.
+    """
+    import re
+    value = value.lower().strip()
+    pattern = re.fullmatch(
+        r'(?:(\d+)\s*(?:ч|h|час|hours?))?'
+        r'\s*(?:(\d+)\s*(?:м|m|мин|min|минут?))?'
+        r'\s*(?:(\d+)\s*(?:с|s|сек|sec|секунд?))?',
+        value
+    )
+    if not pattern:
+        return -1
+    h_str, m_str, s_str = pattern.groups()
+    if not any([h_str, m_str, s_str]):
+        return -1
+    h = int(h_str) if h_str else 0
+    m = int(m_str) if m_str else 0
+    s = int(s_str) if s_str else 0
+    total = h * 3600 + m * 60 + s
+    return total if total > 0 else -1
+
+
 def try_parse_hms_triplet(tokens: list) -> int:
+    """ЧЧ ММ СС через пробел"""
     try:
         h, m, s = int(tokens[0]), int(tokens[1]), int(tokens[2])
         if m >= 60 or s >= 60:
@@ -123,6 +202,7 @@ def try_parse_hms_triplet(tokens: list) -> int:
 
 
 def parse_duration(value: str, unit: str) -> int:
+    """<число> <единица>"""
     unit = unit.lower().strip()
     try:
         v = float(value.replace(",", "."))
@@ -138,7 +218,7 @@ def parse_duration(value: str, unit: str) -> int:
 
 
 def fmt_remaining(finish_at: datetime) -> str:
-    remaining = int((finish_at - datetime.now()).total_seconds())
+    remaining = int((finish_at - now_msk()).total_seconds())
     if remaining <= 0:
         return "завершается..."
     hours, rem = divmod(remaining, 3600)
@@ -157,29 +237,27 @@ def fmt_remaining(finish_at: datetime) -> str:
 
 async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
     try:
-        now = datetime.now()
+        now = now_msk()
         total_remaining = (finish_at - now).total_seconds()
 
         if total_remaining <= 0:
             await send_with_retry(
                 bot, chat_id,
                 f"⚠️ *Таймер «{name}» истёк пока бот был выключен!*\n"
-                f"Время окончания было: {finish_at.strftime('%H:%M:%S %d.%m.%Y')}"
+                f"Время окончания было: {fmt_time(finish_at)}"
             )
             return
 
-        finish_str = finish_at.strftime("%H:%M:%S")
-
         warn_at = finish_at - timedelta(seconds=60)
         if warn_at > now and total_remaining > 60:
-            await asyncio.sleep((warn_at - now).total_seconds())
+            await asyncio.sleep((warn_at - now_msk()).total_seconds())
             await send_with_retry(
                 bot, chat_id,
                 f"⏰ *Внимание!* До конца таймера «{name}» осталась *1 минута*!\n"
-                f"Завершение в {finish_str}"
+                f"Завершение в {fmt_time(finish_at)}"
             )
 
-        remaining_now = (finish_at - datetime.now()).total_seconds()
+        remaining_now = (finish_at - now_msk()).total_seconds()
         if remaining_now > 0:
             await asyncio.sleep(remaining_now)
 
@@ -213,6 +291,9 @@ async def restore_timers(bot):
         for name, finish_iso in timers.items():
             try:
                 finish_at = datetime.fromisoformat(finish_iso)
+                # Если дата без tzinfo — считаем МСК (старые записи)
+                if finish_at.tzinfo is None:
+                    finish_at = finish_at.replace(tzinfo=TZ_MAIN)
             except ValueError:
                 logger.warning("Невалидная дата для таймера '%s', пропускаю.", name)
                 continue
@@ -234,9 +315,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or len(args) < 2:
         await update.message.reply_text(
             "❌ Использование:\n"
-            "`/add <имя> <число> <единица>` — например `/add Пицца 30 мин`\n"
-            "`/add <имя> <ЧЧ:ММ:СС>` — например `/add Пицца 00:30:00`\n"
-            "`/add <имя> ЧЧ ММ СС` — например `/add Пицца 0 30 0`\n"
+            "`/add <имя> <число> <единица>` — `/add Пицца 30 мин`\n"
+            "`/add <имя> <ЧЧ:ММ:СС>` — `/add Пицца 00:30:00`\n"
+            "`/add <имя> ЧЧ ММ СС` — `/add Пицца 0 30 0`\n"
+            "`/add <имя> 1ч30м` — `/add Пицца 1ч30м`\n"
             "Единицы: сек / мин / час",
             parse_mode="Markdown",
         )
@@ -247,16 +329,29 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_duration = ""
     name = ""
 
+    # Формат ЧЧ:ММ:СС
     if ":" in args[-1]:
         name = " ".join(args[:-1])
         seconds = parse_hhmmss(args[-1])
         display_duration = args[-1]
+
+    # Формат 1ч30м (компактный) — один аргумент содержит буквы
+    elif len(args) >= 2 and any(c.isalpha() for c in args[-1]) and any(c.isdigit() for c in args[-1]):
+        compact = parse_compact(args[-1])
+        if compact > 0:
+            name = " ".join(args[:-1])
+            seconds = compact
+            display_duration = args[-1]
+
+    # Формат ЧЧ ММ СС через пробел
     elif len(args) >= 4 and all(a.isdigit() for a in args[-3:]):
         name = " ".join(args[:-3])
         seconds = try_parse_hms_triplet(args[-3:])
         if seconds >= 0:
             h, m, s = int(args[-3]), int(args[-2]), int(args[-1])
             display_duration = f"{h:02d}:{m:02d}:{s:02d}"
+
+    # Формат <число> <единица>
     elif len(args) >= 3:
         name = " ".join(args[:-2])
         seconds = parse_duration(args[-2], args[-1])
@@ -265,8 +360,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name or seconds <= 0:
         await update.message.reply_text(
             "❌ Не удалось распознать команду.\n"
-            "Примеры: `/add Пицца 30 мин`, `/add Стирка 1 час`,\n"
-            "`/add Пицца 00:30:00`, `/add Пицца 0 30 0`",
+            "Примеры: `/add Пицца 30 мин`, `/add Пицца 1ч30м`, `/add Пицца 00:30:00`",
             parse_mode="Markdown",
         )
         return
@@ -275,20 +369,19 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_timers[chat_id][name][0].cancel()
         await update.message.reply_text(f"♻️ Старый таймер «{name}» сброшен, создаю новый.")
 
-    finish_at = datetime.now() + timedelta(seconds=seconds)
+    finish_at = now_msk() + timedelta(seconds=seconds)
     start_timer(context.bot, chat_id, name, finish_at)
     save_timers()
 
-    finish_str = finish_at.strftime("%H:%M:%S")
     warning_note = ""
     if seconds > 60:
-        warn_str = (finish_at - timedelta(seconds=60)).strftime("%H:%M:%S")
-        warning_note = f"\n🔔 Предупреждение в {warn_str}"
+        warn_at = finish_at - timedelta(seconds=60)
+        warning_note = f"\n🔔 Предупреждение в {fmt_time(warn_at)}"
 
     await update.message.reply_text(
         f"✅ Таймер *«{name}»* запущен!\n"
         f"⏱ Продолжительность: {display_duration}\n"
-        f"🏁 Завершение в {finish_str}"
+        f"🏁 Завершение в {fmt_time(finish_at)}"
         f"{warning_note}",
         parse_mode="Markdown",
     )
@@ -310,8 +403,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sorted(timers.items(), key=lambda x: x[1][1]), 1
     ):
         lines.append(
-            f"  {i}. *{name}* — осталось {fmt_remaining(finish_at)} "
-            f"(до {finish_at.strftime('%H:%M:%S')})"
+            f"  {i}. *{name}* — осталось {fmt_remaining(finish_at)}\n"
+            f"      до {fmt_time(finish_at)}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -356,18 +449,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "📖 *Справка по боту:*\n\n"
-        "`/add <имя> <число> <единица>` — создать таймер\n"
-        "   Пример: `/add Пицца 30 мин`\n\n"
-        "`/add <имя> <ЧЧ:ММ:СС>` — таймер через двоеточие\n"
-        "   Пример: `/add Пицца 00:30:00`\n\n"
-        "`/add <имя> ЧЧ ММ СС` — таймер через пробел\n"
-        "   Пример: `/add Пицца 0 30 0`\n\n"
+        "`/add <имя> <число> <единица>`\n"
+        "   `/add Пицца 30 мин`\n\n"
+        "`/add <имя> <ЧЧ:ММ:СС>`\n"
+        "   `/add Пицца 00:30:00`\n\n"
+        "`/add <имя> ЧЧ ММ СС`\n"
+        "   `/add Пицца 0 30 0`\n\n"
+        "`/add <имя> <ч/м/с>`\n"
+        "   `/add Пицца 1ч30м` · `/add Пицца 45м` · `/add Пицца 2ч`\n\n"
         "`/list` — показать активные таймеры\n\n"
         "`/cancel <имя>` — отменить таймер\n"
-        "`/cancel all` — отменить все таймеры\n\n"
+        "`/cancel all` — отменить все\n\n"
         "Единицы: `сек`, `мин`, `час`\n"
-        "Бот предупредит за 1 минуту до завершения (если таймер > 1 мин).\n"
-        "При перезапуске таймеры автоматически восстанавливаются.",
+        "Время отображается в МСК (и Самарском).\n"
+        "Бот предупредит за 1 минуту до завершения.\n"
+        "При перезапуске таймеры восстанавливаются автоматически.",
         parse_mode="Markdown",
     )
 
