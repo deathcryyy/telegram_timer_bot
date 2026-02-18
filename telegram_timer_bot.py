@@ -442,6 +442,47 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🛑 Таймер «{name}» отменён.")
 
 
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await reject(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Использование: `/find <название>`", parse_mode="Markdown"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    timers = active_timers.get(chat_id, {})
+    if not timers:
+        await update.message.reply_text("📭 Нет активных таймеров.")
+        return
+
+    query = " ".join(context.args).lower()
+
+    # Сначала точное совпадение, потом частичное
+    exact   = [(n, d) for n, d in timers.items() if n.lower() == query]
+    partial = [(n, d) for n, d in timers.items() if query in n.lower() and n.lower() != query]
+    matches = exact + partial
+
+    if not matches:
+        await update.message.reply_text(
+            f"❌ Таймер «{' '.join(context.args)}» не найден."
+        )
+        return
+
+    lines = []
+    for name, (task, finish_at) in matches:
+        lines.append(
+            f"⏳ *{name}*\n"
+            f"   Осталось: {fmt_remaining(finish_at)}\n"
+            f"   До {fmt_time(finish_at)}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await reject(update)
@@ -458,6 +499,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/add <имя> <ч/м/с>`\n"
         "   `/add Пицца 1ч30м` · `/add Пицца 45м` · `/add Пицца 2ч`\n\n"
         "`/list` — показать активные таймеры\n\n"
+        "`/find <название>` — найти таймер по названию\n\n"
         "`/cancel <имя>` — отменить таймер\n"
         "`/cancel all` — отменить все\n\n"
         "Единицы: `сек`, `мин`, `час`\n"
@@ -491,6 +533,7 @@ def main():
 
     app.add_handler(CommandHandler("add",    cmd_add))
     app.add_handler(CommandHandler("list",   cmd_list))
+    app.add_handler(CommandHandler("find",   cmd_find))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("start",  cmd_help))
