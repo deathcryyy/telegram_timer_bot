@@ -7,6 +7,8 @@ Telegram Timer Bot
         /add Пицца 30 мин
         /add Стирка 1 час
         /add Лекарство 90 сек
+        /add Пицца 00:30:00
+        /add Пицца 0 30 0
   /list   — список активных таймеров (сортировка по ближайшему)
   /cancel <имя> — отменить таймер
 
@@ -18,7 +20,8 @@ Telegram Timer Bot
 
 Запуск:
   1. Вставьте BOT_TOKEN ниже (получить у @BotFather)
-  2. py telegram_timer_bot.py
+  2. Вставьте ALLOWED_CHAT_ID ниже (ID чата/группы, где работает бот)
+  3. py telegram_timer_bot.py
 """
 
 import asyncio
@@ -36,8 +39,9 @@ from telegram.ext import (
 )
 
 # ───────────────────────────── НАСТРОЙКИ ─────────────────────────────
-BOT_TOKEN   = "8518716891:AAHaKareX_3dzTSDGyzLZV842OzjGFyNRlo"   # <-- токен от @BotFather
-SAVE_FILE   = "timers.json"        # файл сохранения (рядом со скриптом)
+BOT_TOKEN      = "8518716891:AAHaKareX_3dzTSDGyzLZV842OzjGFyNRlo"   # <-- токен от @BotFather
+ALLOWED_CHAT_ID = -5130704239                   # <-- ID чата, где работает бот (например: -1001234567890)
+SAVE_FILE      = "timers.json"        # файл сохранения (рядом со скриптом)
 # ─────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -50,10 +54,26 @@ logger = logging.getLogger(__name__)
 active_timers: Dict[int, Dict[str, tuple]] = {}
 
 
+# ═══════════════════════════ ФИЛЬТР ЧАТА ═════════════════════════════
+
+def allowed(update: Update) -> bool:
+    """Возвращает True, если сообщение из разрешённого чата."""
+    return update.effective_chat.id == ALLOWED_CHAT_ID
+
+
+async def reject(update: Update):
+    """Тихо игнорирует (или можно раскомментировать ответ для отладки)."""
+    logger.warning(
+        "Запрос отклонён: chat_id=%s user=%s",
+        update.effective_chat.id,
+        update.effective_user.id if update.effective_user else "?",
+    )
+    # await update.message.reply_text("⛔ Этот бот работает только в определённом чате.")
+
+
 # ═══════════════════════════ СОХРАНЕНИЕ ══════════════════════════════
 
 def save_timers():
-    """Сохраняет все активные таймеры в JSON-файл."""
     data = {}
     for chat_id, timers in active_timers.items():
         data[str(chat_id)] = {}
@@ -68,7 +88,6 @@ def save_timers():
 
 
 def load_timers_raw() -> dict:
-    """Загружает сырые данные из JSON-файла."""
     if not os.path.exists(SAVE_FILE):
         return {}
     try:
@@ -79,10 +98,13 @@ def load_timers_raw() -> dict:
         return {}
 
 
-# ═══════════════════════════ ТАЙМЕРЫ ═════════════════════════════════
+# ═══════════════════════════ ПАРСИНГ ВРЕМЕНИ ═════════════════════════
 
 def parse_hhmmss(value: str) -> int:
-    """Парсит строку вида ЧЧ:ММ:СС или ММ:СС в секунды. Возвращает -1 при ошибке."""
+    """
+    Парсит строку вида ЧЧ:ММ:СС или ММ:СС в секунды.
+    Возвращает -1 при ошибке.
+    """
     parts = value.split(":")
     try:
         if len(parts) == 3:
@@ -97,6 +119,19 @@ def parse_hhmmss(value: str) -> int:
     except ValueError:
         return -1
 
+
+def try_parse_hms_triplet(tokens: list) -> int:
+    """
+    Пробует распарсить три токена как ЧЧ ММ СС (без двоеточий).
+    Возвращает секунды или -1.
+    """
+    try:
+        h, m, s = int(tokens[0]), int(tokens[1]), int(tokens[2])
+        if m >= 60 or s >= 60:
+            return -1
+        return h * 3600 + m * 60 + s
+    except (ValueError, IndexError):
+        return -1
 
 
 def parse_duration(value: str, unit: str) -> int:
@@ -117,7 +152,6 @@ def parse_duration(value: str, unit: str) -> int:
 
 
 def fmt_remaining(finish_at: datetime) -> str:
-    """Форматирует оставшееся время в читаемую строку."""
     remaining = int((finish_at - datetime.now()).total_seconds())
     if remaining <= 0:
         return "завершается..."
@@ -133,18 +167,14 @@ def fmt_remaining(finish_at: datetime) -> str:
     return " ".join(parts) if parts else "< 1 сек"
 
 
+# ═══════════════════════════ ТАЙМЕРЫ ═════════════════════════════════
+
 async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
-    """
-    Корутина таймера.
-    finish_at — абсолютное время завершения (уже вычислено при создании).
-    При восстановлении после перезапуска корректно досчитывает оставшееся время.
-    """
     try:
         now = datetime.now()
         total_remaining = (finish_at - now).total_seconds()
 
         if total_remaining <= 0:
-            # Таймер уже истёк пока бот был выключен
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -157,7 +187,6 @@ async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
 
         finish_str = finish_at.strftime("%H:%M:%S")
 
-        # Нужно ли ещё слать предупреждение за 1 минуту?
         warn_at = finish_at - timedelta(seconds=60)
         if warn_at > now and total_remaining > 60:
             sleep_until_warn = (warn_at - now).total_seconds()
@@ -171,7 +200,6 @@ async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
                 parse_mode="Markdown",
             )
 
-        # Ждём до самого конца
         remaining_now = (finish_at - datetime.now()).total_seconds()
         if remaining_now > 0:
             await asyncio.sleep(remaining_now)
@@ -189,11 +217,10 @@ async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
             del active_timers[chat_id][name]
             if not active_timers[chat_id]:
                 del active_timers[chat_id]
-        save_timers()  # обновляем файл после завершения/отмены
+        save_timers()
 
 
 def start_timer(bot, chat_id: int, name: str, finish_at: datetime) -> asyncio.Task:
-    """Создаёт asyncio-задачу для таймера и регистрирует её."""
     task = asyncio.create_task(timer_task(bot, chat_id, name, finish_at))
     active_timers.setdefault(chat_id, {})[name] = (task, finish_at)
     return task
@@ -202,7 +229,6 @@ def start_timer(bot, chat_id: int, name: str, finish_at: datetime) -> asyncio.Ta
 # ═══════════════════════ ВОССТАНОВЛЕНИЕ ══════════════════════════════
 
 async def restore_timers(bot):
-    """При запуске бота восстанавливает таймеры из файла."""
     raw = load_timers_raw()
     if not raw:
         return
@@ -227,13 +253,18 @@ async def restore_timers(bot):
 # ═════════════════════════ ОБРАБОТЧИКИ ═══════════════════════════════
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/add <имя> <число> <единица>  или  /add <имя> <ЧЧ:ММ:СС>"""
+    """/add <имя> <число> <единица>  |  /add <имя> <ЧЧ:ММ:СС>  |  /add <имя> ЧЧ ММ СС"""
+    if not allowed(update):
+        await reject(update)
+        return
+
     args = context.args
     if not args or len(args) < 2:
         await update.message.reply_text(
             "❌ Использование:\n"
             "`/add <имя> <число> <единица>` — например `/add Пицца 30 мин`\n"
             "`/add <имя> <ЧЧ:ММ:СС>` — например `/add Пицца 00:30:00`\n"
+            "`/add <имя> ЧЧ ММ СС` — например `/add Пицца 0 30 0`\n"
             "Единицы: сек / мин / час",
             parse_mode="Markdown",
         )
@@ -244,13 +275,21 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_duration = ""
     name = ""
 
-    # Формат ЧЧ:ММ:СС — последний аргумент содержит ":"
+    # ── Формат ЧЧ:ММ:СС — последний аргумент содержит ":"
     if ":" in args[-1]:
         name = " ".join(args[:-1])
         seconds = parse_hhmmss(args[-1])
         display_duration = args[-1]
 
-    # Формат <число> <единица> — нужно минимум 3 аргумента: имя число единица
+    # ── Формат ЧЧ ММ СС (три числа без двоеточий в конце)
+    elif len(args) >= 4 and all(a.isdigit() for a in args[-3:]):
+        name = " ".join(args[:-3])
+        seconds = try_parse_hms_triplet(args[-3:])
+        if seconds >= 0:
+            h, m, s = int(args[-3]), int(args[-2]), int(args[-1])
+            display_duration = f"{h:02d}:{m:02d}:{s:02d}"
+
+    # ── Формат <число> <единица>
     elif len(args) >= 3:
         name = " ".join(args[:-2])
         value_str = args[-2]
@@ -261,12 +300,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name or seconds <= 0:
         await update.message.reply_text(
             "❌ Не удалось распознать команду.\n"
-            "Используйте: `/add Пицца 30 мин`, `/add Стирка 1 час` или `/add Пицца 00:30:00`",
+            "Примеры: `/add Пицца 30 мин`, `/add Стирка 1 час`,\n"
+            "`/add Пицца 00:30:00`, `/add Пицца 0 30 0`",
             parse_mode="Markdown",
         )
         return
 
-    # Если таймер с таким именем уже есть — отменяем старый
     if chat_id in active_timers and name in active_timers[chat_id]:
         active_timers[chat_id][name][0].cancel()
         await update.message.reply_text(f"♻️ Старый таймер «{name}» сброшен, создаю новый.")
@@ -291,7 +330,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/list — список активных таймеров, от ближайшего к дальнему."""
+    if not allowed(update):
+        await reject(update)
+        return
+
     chat_id = update.effective_chat.id
     timers = active_timers.get(chat_id, {})
 
@@ -311,7 +353,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cancel <имя> | all — отменить таймер по имени или все сразу."""
+    if not allowed(update):
+        await reject(update)
+        return
+
     if not context.args:
         await update.message.reply_text(
             "❌ Использование: `/cancel <имя>` или `/cancel all`", parse_mode="Markdown"
@@ -341,12 +386,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await reject(update)
+        return
+
     await update.message.reply_text(
         "📖 *Справка по боту:*\n\n"
         "`/add <имя> <число> <единица>` — создать таймер\n"
-        "   Пример: `/add Пицца 30 мин`\n"
-        "`/add <имя> <ЧЧ:ММ:СС>` — создать таймер в формате времени\n"
+        "   Пример: `/add Пицца 30 мин`\n\n"
+        "`/add <имя> <ЧЧ:ММ:СС>` — таймер через двоеточие\n"
         "   Пример: `/add Пицца 00:30:00`\n\n"
+        "`/add <имя> ЧЧ ММ СС` — таймер через пробел\n"
+        "   Пример: `/add Пицца 0 30 0`\n\n"
         "`/list` — показать активные таймеры\n\n"
         "`/cancel <имя>` — отменить таймер\n"
         "`/cancel all` — отменить все таймеры\n\n"
@@ -360,13 +411,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════ MAIN ════════════════════════════════
 
 async def post_init(application: Application):
-    """Вызывается после инициализации бота — восстанавливаем таймеры."""
     await restore_timers(application.bot)
 
 
 def main():
     if BOT_TOKEN == "ВАШ_ТОКЕН_ЗДЕСЬ":
         print("❌ Пожалуйста, вставьте токен бота в переменную BOT_TOKEN!")
+        return
+    if ALLOWED_CHAT_ID == 0:
+        print("❌ Пожалуйста, укажите ID чата в переменной ALLOWED_CHAT_ID!")
         return
 
     app = (
@@ -382,7 +435,7 @@ def main():
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("start",  cmd_help))
 
-    logger.info("Бот запущен. Нажмите Ctrl+C для остановки.")
+    logger.info("Бот запущен. Разрешённый чат: %s. Нажмите Ctrl+C для остановки.", ALLOWED_CHAT_ID)
     app.run_polling(drop_pending_updates=True)
 
 
