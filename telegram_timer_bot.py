@@ -13,7 +13,7 @@ Telegram Timer Bot
         /add Пицца 45м
         /add Пицца 2ч
   /list   — список активных таймеров
-  /cancel <имя> — отменить таймер
+  /cancel <имя> — отменить таймер (только для администраторов)
 
 Установка: py -m pip install python-telegram-bot redis --upgrade
 """
@@ -70,10 +70,28 @@ async def reject(update: Update):
     logger.warning("Запрос отклонён: chat_id=%s", update.effective_chat.id)
 
 
+# ═══════════════════════════ ПРОВЕРКА ПРАВ ═══════════════════════════
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверяет, является ли пользователь администратором или создателем чата."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # В личных чатах (приватных) — считаем администратором
+    if update.effective_chat.type == "private":
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception as e:
+        logger.error("Ошибка проверки прав администратора: %s", e)
+        return False
+
+
 # ═══════════════════════════ СОХРАНЕНИЕ ══════════════════════════════
 
 def save_timers():
-    # Пробуем Redis если доступен
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
         try:
@@ -90,7 +108,6 @@ def save_timers():
         except Exception as e:
             logger.error("Ошибка сохранения в Redis: %s", e)
 
-    # Fallback — файл
     data = {}
     for chat_id, timers in active_timers.items():
         data[str(chat_id)] = {
@@ -149,7 +166,6 @@ async def send_with_retry(bot, chat_id: int, text: str, retries: int = 5, delay:
 # ═══════════════════════════ ПАРСИНГ ВРЕМЕНИ ═════════════════════════
 
 def parse_hhmmss(value: str) -> int:
-    """ЧЧ:ММ:СС или ММ:СС"""
     parts = value.split(":")
     try:
         if len(parts) == 3:
@@ -166,10 +182,6 @@ def parse_hhmmss(value: str) -> int:
 
 
 def parse_compact(value: str) -> int:
-    """
-    Парсит компактный формат: 1ч30м, 45м, 2ч, 90с, 1ч30м20с и т.д.
-    Возвращает секунды или -1.
-    """
     import re
     value = value.lower().strip()
     pattern = re.fullmatch(
@@ -191,7 +203,6 @@ def parse_compact(value: str) -> int:
 
 
 def try_parse_hms_triplet(tokens: list) -> int:
-    """ЧЧ ММ СС через пробел"""
     try:
         h, m, s = int(tokens[0]), int(tokens[1]), int(tokens[2])
         if m >= 60 or s >= 60:
@@ -202,7 +213,6 @@ def try_parse_hms_triplet(tokens: list) -> int:
 
 
 def parse_duration(value: str, unit: str) -> int:
-    """<число> <единица>"""
     unit = unit.lower().strip()
     try:
         v = float(value.replace(",", "."))
@@ -291,7 +301,6 @@ async def restore_timers(bot):
         for name, finish_iso in timers.items():
             try:
                 finish_at = datetime.fromisoformat(finish_iso)
-                # Если дата без tzinfo — считаем МСК (старые записи)
                 if finish_at.tzinfo is None:
                     finish_at = finish_at.replace(tzinfo=TZ_MAIN)
             except ValueError:
@@ -329,13 +338,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_duration = ""
     name = ""
 
-    # Формат ЧЧ:ММ:СС
     if ":" in args[-1]:
         name = " ".join(args[:-1])
         seconds = parse_hhmmss(args[-1])
         display_duration = args[-1]
 
-    # Формат 1ч30м (компактный) — один аргумент содержит буквы
     elif len(args) >= 2 and any(c.isalpha() for c in args[-1]) and any(c.isdigit() for c in args[-1]):
         compact = parse_compact(args[-1])
         if compact > 0:
@@ -343,7 +350,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seconds = compact
             display_duration = args[-1]
 
-    # Формат ЧЧ ММ СС через пробел
     elif len(args) >= 4 and all(a.isdigit() for a in args[-3:]):
         name = " ".join(args[:-3])
         seconds = try_parse_hms_triplet(args[-3:])
@@ -351,7 +357,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             h, m, s = int(args[-3]), int(args[-2]), int(args[-1])
             display_duration = f"{h:02d}:{m:02d}:{s:02d}"
 
-    # Формат <число> <единица>
     elif len(args) >= 3:
         name = " ".join(args[:-2])
         seconds = parse_duration(args[-2], args[-1])
@@ -414,6 +419,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject(update)
         return
 
+    # ── Проверка прав администратора ──
+    if not await is_admin(update, context):
+        await update.message.reply_text(
+            "🚫 Отменять таймеры могут только администраторы беседы."
+        )
+        return
+
     if not context.args:
         await update.message.reply_text(
             "❌ Использование: `/cancel <имя>` или `/cancel all`", parse_mode="Markdown"
@@ -461,7 +473,6 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = " ".join(context.args).lower()
 
-    # Сначала точное совпадение, потом частичное
     exact   = [(n, d) for n, d in timers.items() if n.lower() == query]
     partial = [(n, d) for n, d in timers.items() if query in n.lower() and n.lower() != query]
     matches = exact + partial
@@ -500,8 +511,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   `/add Пицца 1ч30м` · `/add Пицца 45м` · `/add Пицца 2ч`\n\n"
         "`/list` — показать активные таймеры\n\n"
         "`/find <название>` — найти таймер по названию\n\n"
-        "`/cancel <имя>` — отменить таймер\n"
-        "`/cancel all` — отменить все\n\n"
+        "`/cancel <имя>` — отменить таймер *(только администраторы)*\n"
+        "`/cancel all` — отменить все *(только администраторы)*\n\n"
         "Единицы: `сек`, `мин`, `час`\n"
         "Время отображается в МСК (и Самарском).\n"
         "Бот предупредит за 1 минуту до завершения.\n"
