@@ -34,6 +34,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN       = "8518716891:AAHaKareX_3dzTSDGyzLZV842OzjGFyNRlo"   # <-- токен от @BotFather
 ALLOWED_CHAT_ID = -5130704239                    # <-- ID чата (например: -1001234567890)
 SAVE_FILE       = "timers.json"
+SAVE_FILE_L     = "timers_l.json"
 
 TZ_MAIN   = ZoneInfo("Europe/Moscow")   # МСК (UTC+3)
 TZ_SAMARA = ZoneInfo("Europe/Samara")   # Самара (UTC+4)
@@ -45,7 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-active_timers: Dict[int, Dict[str, tuple]] = {}
+active_timers:   Dict[int, Dict[str, tuple]] = {}
+active_timers_l: Dict[int, Dict[str, tuple]] = {}
 
 
 # ═══════════════════════════ ВРЕМЯ ═══════════════════════════════════
@@ -91,53 +93,61 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 # ═══════════════════════════ СОХРАНЕНИЕ ══════════════════════════════
 
-def save_timers():
+def save_timers(storage: dict = None, save_file: str = None, redis_key: str = "timers"):
+    if storage is None:
+        storage = active_timers
+    if save_file is None:
+        save_file = SAVE_FILE
+
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
         try:
             import redis
             r = redis.from_url(redis_url)
             data = {}
-            for chat_id, timers in active_timers.items():
+            for chat_id, timers in storage.items():
                 data[str(chat_id)] = {
                     name: finish_at.isoformat()
                     for name, (task, finish_at) in timers.items()
                 }
-            r.set("timers", json.dumps(data, ensure_ascii=False))
+            r.set(redis_key, json.dumps(data, ensure_ascii=False))
             return
         except Exception as e:
             logger.error("Ошибка сохранения в Redis: %s", e)
 
     data = {}
-    for chat_id, timers in active_timers.items():
+    for chat_id, timers in storage.items():
         data[str(chat_id)] = {
             name: finish_at.isoformat()
             for name, (task, finish_at) in timers.items()
         }
     try:
-        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        with open(save_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error("Ошибка сохранения таймеров: %s", e)
 
 
-def load_timers_raw() -> dict:
+def load_timers_raw(save_file: str = None, redis_key: str = "timers") -> dict:
+    if save_file is None:
+        save_file = SAVE_FILE
+
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
         try:
             import redis
             r = redis.from_url(redis_url)
-            raw = r.get("timers")
+            raw = r.get(redis_key)
             if raw:
                 return json.loads(raw)
             return {}
         except Exception as e:
             logger.error("Ошибка чтения из Redis: %s", e)
 
-    if not os.path.exists(SAVE_FILE):
+    if not os.path.exists(save_file):
         return {}
     try:
-        with open(SAVE_FILE, "r", encoding="utf-8") as f:
+        with open(save_file, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         logger.error("Ошибка чтения файла таймеров: %s", e)
@@ -245,7 +255,9 @@ def fmt_remaining(finish_at: datetime) -> str:
 
 # ═══════════════════════════ ТАЙМЕРЫ ═════════════════════════════════
 
-async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
+async def timer_task(bot, chat_id: int, name: str, finish_at: datetime, storage: dict = None):
+    if storage is None:
+        storage = active_timers
     try:
         now = now_msk()
         total_remaining = (finish_at - now).total_seconds()
@@ -276,120 +288,55 @@ async def timer_task(bot, chat_id: int, name: str, finish_at: datetime):
     except asyncio.CancelledError:
         logger.info("Таймер '%s' для чата %s отменён.", name, chat_id)
     finally:
-        if chat_id in active_timers and name in active_timers[chat_id]:
-            del active_timers[chat_id][name]
-            if not active_timers[chat_id]:
-                del active_timers[chat_id]
-        save_timers()
+        if chat_id in storage and name in storage[chat_id]:
+            del storage[chat_id][name]
+            if not storage[chat_id]:
+                del storage[chat_id]
+        save_file = SAVE_FILE_L if storage is active_timers_l else SAVE_FILE
+        redis_key = "timers_l" if storage is active_timers_l else "timers"
+        save_timers(storage, save_file, redis_key)
 
 
-def start_timer(bot, chat_id: int, name: str, finish_at: datetime) -> asyncio.Task:
-    task = asyncio.create_task(timer_task(bot, chat_id, name, finish_at))
-    active_timers.setdefault(chat_id, {})[name] = (task, finish_at)
+def start_timer(bot, chat_id: int, name: str, finish_at: datetime, storage: dict = None) -> asyncio.Task:
+    if storage is None:
+        storage = active_timers
+    task = asyncio.create_task(timer_task(bot, chat_id, name, finish_at, storage))
+    storage.setdefault(chat_id, {})[name] = (task, finish_at)
     return task
 
 
 # ═══════════════════════ ВОССТАНОВЛЕНИЕ ══════════════════════════════
 
 async def restore_timers(bot):
-    raw = load_timers_raw()
-    if not raw:
-        return
-    restored = 0
-    for chat_id_str, timers in raw.items():
-        chat_id = int(chat_id_str)
-        for name, finish_iso in timers.items():
-            try:
-                finish_at = datetime.fromisoformat(finish_iso)
-                if finish_at.tzinfo is None:
-                    finish_at = finish_at.replace(tzinfo=TZ_MAIN)
-            except ValueError:
-                logger.warning("Невалидная дата для таймера '%s', пропускаю.", name)
-                continue
-            start_timer(bot, chat_id, name, finish_at)
-            restored += 1
-    if restored:
-        logger.info("Восстановлено таймеров: %d", restored)
-        save_timers()
+    for storage, save_file, redis_key in [
+        (active_timers,   SAVE_FILE,   "timers"),
+        (active_timers_l, SAVE_FILE_L, "timers_l"),
+    ]:
+        raw = load_timers_raw(save_file, redis_key)
+        if not raw:
+            continue
+        restored = 0
+        for chat_id_str, timers in raw.items():
+            chat_id = int(chat_id_str)
+            for name, finish_iso in timers.items():
+                try:
+                    finish_at = datetime.fromisoformat(finish_iso)
+                    if finish_at.tzinfo is None:
+                        finish_at = finish_at.replace(tzinfo=TZ_MAIN)
+                except ValueError:
+                    logger.warning("Невалидная дата для таймера '%s', пропускаю.", name)
+                    continue
+                start_timer(bot, chat_id, name, finish_at, storage)
+                restored += 1
+        if restored:
+            logger.info("Восстановлено таймеров (%s): %d", save_file, restored)
+            save_timers(storage, save_file, redis_key)
 
 
 # ═════════════════════════ ОБРАБОТЧИКИ ═══════════════════════════════
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        await reject(update)
-        return
-
-    args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            "❌ Использование:\n"
-            "`/add <имя> <число> <единица>` — `/add Пицца 30 мин`\n"
-            "`/add <имя> <ЧЧ:ММ:СС>` — `/add Пицца 00:30:00`\n"
-            "`/add <имя> ЧЧ ММ СС` — `/add Пицца 0 30 0`\n"
-            "`/add <имя> 1ч30м` — `/add Пицца 1ч30м`\n"
-            "Единицы: сек / мин / час",
-            parse_mode="Markdown",
-        )
-        return
-
-    chat_id = update.effective_chat.id
-    seconds = -1
-    display_duration = ""
-    name = ""
-
-    if ":" in args[-1]:
-        name = " ".join(args[:-1])
-        seconds = parse_hhmmss(args[-1])
-        display_duration = args[-1]
-
-    elif len(args) >= 2 and any(c.isalpha() for c in args[-1]) and any(c.isdigit() for c in args[-1]):
-        compact = parse_compact(args[-1])
-        if compact > 0:
-            name = " ".join(args[:-1])
-            seconds = compact
-            display_duration = args[-1]
-
-    elif len(args) >= 4 and all(a.isdigit() for a in args[-3:]):
-        name = " ".join(args[:-3])
-        seconds = try_parse_hms_triplet(args[-3:])
-        if seconds >= 0:
-            h, m, s = int(args[-3]), int(args[-2]), int(args[-1])
-            display_duration = f"{h:02d}:{m:02d}:{s:02d}"
-
-    elif len(args) >= 3:
-        name = " ".join(args[:-2])
-        seconds = parse_duration(args[-2], args[-1])
-        display_duration = f"{args[-2]} {args[-1]}"
-
-    if not name or seconds <= 0:
-        await update.message.reply_text(
-            "❌ Не удалось распознать команду.\n"
-            "Примеры: `/add Пицца 30 мин`, `/add Пицца 1ч30м`, `/add Пицца 00:30:00`",
-            parse_mode="Markdown",
-        )
-        return
-
-    if chat_id in active_timers and name in active_timers[chat_id]:
-        active_timers[chat_id][name][0].cancel()
-        await update.message.reply_text(f"♻️ Старый таймер «{name}» сброшен, создаю новый.")
-
-    finish_at = now_msk() + timedelta(seconds=seconds)
-    start_timer(context.bot, chat_id, name, finish_at)
-    save_timers()
-
-    warning_note = ""
-    if seconds > 60:
-        warn_at = finish_at - timedelta(seconds=60)
-        warning_note = f"\n🔔 Предупреждение в {fmt_time(warn_at)}"
-
-    await update.message.reply_text(
-        f"✅ Таймер *«{name}»* запущен!\n"
-        f"⏱ Продолжительность: {display_duration}\n"
-        f"🏁 Завершение в {fmt_time(finish_at)}"
-        f"{warning_note}",
-        parse_mode="Markdown",
-    )
+    await _cmd_add_generic(update, context, active_timers, SAVE_FILE, "timers", "add")
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,10 +347,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     timers = active_timers.get(chat_id, {})
     if not timers:
-        await update.message.reply_text("📭 Нет активных таймеров.")
+        await update.message.reply_text("📭 Нет активных таймеров (от /add).")
         return
 
-    lines = ["⏳ *Активные таймеры:*"]
+    lines = ["⏳ *Активные таймеры (/add):*"]
     for i, (name, (task, finish_at)) in enumerate(
         sorted(timers.items(), key=lambda x: x[1][1]), 1
     ):
@@ -452,6 +399,150 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     active_timers[chat_id][name][0].cancel()
     await update.message.reply_text(f"🛑 Таймер «{name}» отменён.")
+
+
+async def _cmd_add_generic(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           storage: dict, save_file: str, redis_key: str, prefix: str):
+    """Общая логика для /add и /addL."""
+    if not allowed(update):
+        await reject(update)
+        return
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            f"❌ Использование:\n"
+            f"`/{prefix} <имя> <число> <единица>` — `/{prefix} Пицца 30 мин`\n"
+            f"`/{prefix} <имя> <ЧЧ:ММ:СС>` — `/{prefix} Пицца 00:30:00`\n"
+            f"`/{prefix} <имя> ЧЧ ММ СС` — `/{prefix} Пицца 0 30 0`\n"
+            f"`/{prefix} <имя> 1ч30м` — `/{prefix} Пицца 1ч30м`\n"
+            "Единицы: сек / мин / час",
+            parse_mode="Markdown",
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    seconds = -1
+    display_duration = ""
+    name = ""
+
+    if ":" in args[-1]:
+        name = " ".join(args[:-1])
+        seconds = parse_hhmmss(args[-1])
+        display_duration = args[-1]
+
+    elif len(args) >= 2 and any(c.isalpha() for c in args[-1]) and any(c.isdigit() for c in args[-1]):
+        compact = parse_compact(args[-1])
+        if compact > 0:
+            name = " ".join(args[:-1])
+            seconds = compact
+            display_duration = args[-1]
+
+    elif len(args) >= 4 and all(a.isdigit() for a in args[-3:]):
+        name = " ".join(args[:-3])
+        seconds = try_parse_hms_triplet(args[-3:])
+        if seconds >= 0:
+            h, m, s = int(args[-3]), int(args[-2]), int(args[-1])
+            display_duration = f"{h:02d}:{m:02d}:{s:02d}"
+
+    elif len(args) >= 3:
+        name = " ".join(args[:-2])
+        seconds = parse_duration(args[-2], args[-1])
+        display_duration = f"{args[-2]} {args[-1]}"
+
+    if not name or seconds <= 0:
+        await update.message.reply_text(
+            f"❌ Не удалось распознать команду.\n"
+            f"Примеры: `/{prefix} Пицца 30 мин`, `/{prefix} Пицца 1ч30м`, `/{prefix} Пицца 00:30:00`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if chat_id in storage and name in storage[chat_id]:
+        storage[chat_id][name][0].cancel()
+        await update.message.reply_text(f"♻️ Старый таймер «{name}» сброшен, создаю новый.")
+
+    finish_at = now_msk() + timedelta(seconds=seconds)
+    start_timer(context.bot, chat_id, name, finish_at, storage)
+    save_timers(storage, save_file, redis_key)
+
+    warning_note = ""
+    if seconds > 60:
+        warn_at = finish_at - timedelta(seconds=60)
+        warning_note = f"\n🔔 Предупреждение в {fmt_time(warn_at)}"
+
+    await update.message.reply_text(
+        f"✅ Таймер *«{name}»* запущен!\n"
+        f"⏱ Продолжительность: {display_duration}\n"
+        f"🏁 Завершение в {fmt_time(finish_at)}"
+        f"{warning_note}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_add_l(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_add_generic(update, context, active_timers_l, SAVE_FILE_L, "timers_l", "addL")
+
+
+async def cmd_list_l(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await reject(update)
+        return
+
+    chat_id = update.effective_chat.id
+    timers = active_timers_l.get(chat_id, {})
+    if not timers:
+        await update.message.reply_text("📭 Нет активных L-таймеров (от /addL).")
+        return
+
+    lines = ["⏳ *Активные L-таймеры (/addL):*"]
+    for i, (name, (task, finish_at)) in enumerate(
+        sorted(timers.items(), key=lambda x: x[1][1]), 1
+    ):
+        lines.append(
+            f"  {i}. *{name}* — осталось {fmt_remaining(finish_at)}\n"
+            f"      до {fmt_time(finish_at)}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_cancel_l(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await reject(update)
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text(
+            "🚫 Отменять таймеры могут только администраторы беседы."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Использование: `/cancelL <имя>` или `/cancelL all`", parse_mode="Markdown"
+        )
+        return
+
+    name = " ".join(context.args)
+    chat_id = update.effective_chat.id
+
+    if name.lower() == "all":
+        timers = active_timers_l.get(chat_id, {})
+        if not timers:
+            await update.message.reply_text("📭 Нет активных L-таймеров для отмены.")
+            return
+        count = len(timers)
+        for task, _ in list(timers.values()):
+            task.cancel()
+        await update.message.reply_text(f"🛑 Все L-таймеры отменены ({count} шт.).")
+        return
+
+    if chat_id not in active_timers_l or name not in active_timers_l[chat_id]:
+        await update.message.reply_text(f"❌ L-таймер «{name}» не найден.")
+        return
+
+    active_timers_l[chat_id][name][0].cancel()
+    await update.message.reply_text(f"🛑 L-таймер «{name}» отменён.")
 
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -509,7 +600,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   `/add Пицца 0 30 0`\n\n"
         "`/add <имя> <ч/м/с>`\n"
         "   `/add Пицца 1ч30м` · `/add Пицца 45м` · `/add Пицца 2ч`\n\n"
-        "`/list` — показать активные таймеры\n\n"
+        "`/list` — показать таймеры от /add\n\n"
+        "`/addL` — то же, что /add, но в отдельный список\n"
+        "`/listL` — показать таймеры от /addL\n"
+        "`/cancelL <имя>` — отменить L-таймер *(только администраторы)*\n"
+        "`/cancelL all` — отменить все L-таймеры *(только администраторы)*\n\n"
         "`/find <название>` — найти таймер по названию\n\n"
         "`/cancel <имя>` — отменить таймер *(только администраторы)*\n"
         "`/cancel all` — отменить все *(только администраторы)*\n\n"
@@ -542,12 +637,15 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("add",    cmd_add))
-    app.add_handler(CommandHandler("list",   cmd_list))
-    app.add_handler(CommandHandler("find",   cmd_find))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("start",  cmd_help))
+    app.add_handler(CommandHandler("add",     cmd_add))
+    app.add_handler(CommandHandler("addL",    cmd_add_l))
+    app.add_handler(CommandHandler("list",    cmd_list))
+    app.add_handler(CommandHandler("listL",   cmd_list_l))
+    app.add_handler(CommandHandler("find",    cmd_find))
+    app.add_handler(CommandHandler("cancel",  cmd_cancel))
+    app.add_handler(CommandHandler("cancelL", cmd_cancel_l))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("start",   cmd_help))
 
     logger.info("Бот запущен. Разрешённый чат: %s.", ALLOWED_CHAT_ID)
     app.run_polling(drop_pending_updates=True)
